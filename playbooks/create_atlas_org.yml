@@ -1,0 +1,87 @@
+---
+- name: Create MongoDB Atlas Organization (idempotent-ish)
+  hosts: localhost
+  gather_facts: no
+  vars:
+    atlas_api_base: "https://cloud.mongodb.com/api/atlas/v2"
+    atlas_accept: "application/json"  # Change to a versioned vendor header if required
+  tasks:
+    - name: Collect Atlas API keys from environment
+      ansible.builtin.set_fact:
+        atlas_public_key: "{{ lookup('env','MONGODB_ATLAS_PUBLIC_KEY') | default('', true) }}"
+        atlas_private_key: "{{ lookup('env','MONGODB_ATLAS_PRIVATE_KEY') | default('', true) }}"
+
+    - name: Assert required inputs and secrets exist
+      ansible.builtin.assert:
+        that:
+          - org_name is defined
+          - (atlas_public_key | length) > 0
+          - (atlas_private_key | length) > 0
+        fail_msg: >
+          Missing org_name or Atlas API keys.
+          Provide -e org_name='Your Org' and set MONGODB_ATLAS_PUBLIC_KEY / MONGODB_ATLAS_PRIVATE_KEY
+          (in AAP, attach the Atlas credential).
+
+    - name: Best-effort list organizations (may fail if key can't list across orgs)
+      ansible.builtin.uri:
+        url: "{{ atlas_api_base }}/orgs?pretty=false"
+        method: GET
+        url_username: "{{ atlas_public_key }}"
+        url_password: "{{ atlas_private_key }}"
+        headers:
+          Accept: "{{ atlas_accept }}"
+        return_content: yes
+        status_code: 200
+        validate_certs: yes
+      register: orgs_resp
+      failed_when: false
+
+    - name: Find if the org already exists (by name)
+      ansible.builtin.set_fact:
+        existing_org: >-
+          {{
+            (
+              (orgs_resp.json.results | default(orgs_resp.json | default([])))
+              | selectattr('name','equalto', org_name)
+              | list | first | default(None)
+            )
+          }}
+
+    - name: Create organization if not present
+      ansible.builtin.uri:
+        url: "{{ atlas_api_base }}/orgs"
+        method: POST
+        url_username: "{{ atlas_public_key }}"
+        url_password: "{{ atlas_private_key }}"
+        headers:
+          Accept: "{{ atlas_accept }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          name: "{{ org_name }}"
+        status_code: [201, 409]   # 409 = already exists (treat as OK)
+        return_content: yes
+        validate_certs: yes
+      register: create_resp
+      when: existing_org is not defined or existing_org is none
+
+    - name: Determine organization id and action
+      ansible.builtin.set_fact:
+        org_id: >-
+          {{
+            (existing_org.id
+              if (existing_org is defined and existing_org)
+              else (create_resp.json.id | default(None)))
+          }}
+        org_action: >-
+          {{
+            ('existing (no change)' if (existing_org is defined and existing_org)
+             else ('created' if (create_resp.status == 201) else 'exists (409)'))
+          }}
+
+    - name: Show result
+      ansible.builtin.debug:
+        msg:
+          - "Organization name: {{ org_name }}"
+          - "Organization ID: {{ org_id | default('unknown') }}"
+          - "Action: {{ org_action }}"
